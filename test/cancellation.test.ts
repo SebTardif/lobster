@@ -3584,7 +3584,7 @@ test("workflow pipeline terminates an in-flight send and halts under cancellatio
 	}
 });
 
-test("parallel timeout kills in-flight sends before retrying", async () => {
+test("parallel timeout kills in-flight sends without retrying", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "lobster-parallel-timeout-send-settlement-"));
 	try {
 		const repoRoot = join(__dirname, "..", "..");
@@ -3647,7 +3647,11 @@ test("parallel timeout kills in-flight sends before retrying", async () => {
 			"a timeout must kill its in-flight send before retry policy returns",
 		);
 		const invocations = (await readFile(sendInvocations, "utf8")).trim().split(/\r?\n/);
-		assert.equal(invocations.length, 2);
+		assert.equal(
+			invocations.length,
+			1,
+			"a timed-out send must not retry; Gmail may already have accepted the first message",
+		);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}

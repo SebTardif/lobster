@@ -1564,6 +1564,9 @@ export async function runWorkflowFile({
 									) {
 										return false;
 									}
+									if (stepTouchesEmailSend(step)) {
+										return false;
+									}
 									const message = error?.message ?? String(error);
 									return !/halted (for approval inside|before completion at) pipeline/.test(
 										message,
@@ -2553,6 +2556,25 @@ function evaluateCondition(condition: unknown, results: Record<string, WorkflowS
 	if (trimmed === "true") return true;
 	if (trimmed === "false") return false;
 	return evaluateConditionExpression(trimmed, results);
+}
+
+function collectStepCommandText(step: WorkflowStep): string[] {
+	const texts: string[] = [];
+	if (typeof step.pipeline === "string") texts.push(step.pipeline);
+	if (typeof step.command === "string") texts.push(step.command);
+	if (typeof step.run === "string") texts.push(step.run);
+	for (const branch of step.parallel?.branches ?? []) {
+		if (typeof branch.pipeline === "string") texts.push(branch.pipeline);
+		if (typeof branch.command === "string") texts.push(branch.command);
+		if (typeof branch.run === "string") texts.push(branch.run);
+	}
+	return texts;
+}
+
+function stepTouchesEmailSend(step: WorkflowStep): boolean {
+	return collectStepCommandText(step).some((text) =>
+		/(^|[\s|])gog\.gmail\.send(?=$|[\s|])/.test(text),
+	);
 }
 
 function isApprovalStep(approval: WorkflowStep["approval"]) {
