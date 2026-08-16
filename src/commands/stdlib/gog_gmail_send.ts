@@ -76,6 +76,7 @@ export const gogGmailSendCommand = {
 			];
 
 			const argv = isScript ? [gogBinRaw, ...argvBase] : argvBase;
+			ctx.onNonRetryableSideEffect?.();
 			const res = await runAbortableProcess({
 				command: gogBin,
 				argv,

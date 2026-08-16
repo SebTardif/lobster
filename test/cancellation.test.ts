@@ -3657,6 +3657,124 @@ test("parallel timeout kills in-flight sends without retrying", async () => {
 	}
 });
 
+test("a templated Gmail send pipeline is not retried after timeout", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "lobster-templated-send-retry-"));
+	try {
+		const repoRoot = join(__dirname, "..", "..");
+		const mockGog = join(repoRoot, "test", "fixtures", "mock-gog-cancellation.mjs");
+		const filePath = join(dir, "workflow.lobster");
+		const sendStarted = join(dir, "send-started");
+		const sendInvocations = join(dir, "send-invocations");
+		await writeFile(
+			filePath,
+			JSON.stringify({
+				args: { send_pipeline: { default: "gog.gmail.send" } },
+				steps: [
+					{
+						id: "draft",
+						run: `${JSON.stringify(process.execPath)} -e "process.stdout.write(JSON.stringify({to:'user@example.com',subject:'Hello',body:'World'}))"`,
+					},
+					{
+						id: "send",
+						pipeline: "${send_pipeline}",
+						stdin: "$draft.json",
+						timeout_ms: 80,
+						retry: { max: 2, delay_ms: 0 },
+					},
+				],
+			}),
+			"utf8",
+		);
+
+		const run = runToolRequest({
+			filePath,
+			ctx: {
+				cwd: dir,
+				registry: createDefaultRegistry(),
+				env: {
+					...process.env,
+					LOBSTER_STATE_DIR: join(dir, "state"),
+					GOG_BIN: mockGog,
+					MOCK_GOG_SEND_STARTED_FILE: sendStarted,
+					MOCK_GOG_SEND_INVOCATIONS_FILE: sendInvocations,
+					MOCK_GOG_COMPLETION_DELAY_MS: "300",
+				},
+			},
+		});
+
+		await waitForFile(sendStarted);
+		const result = await run;
+		assert.equal(result.ok, false);
+		assert.match(result.error?.message ?? "", /timed out|timeout|abort|cancel/i);
+		const invocations = (await readFile(sendInvocations, "utf8")).trim().split(/\r?\n/);
+		assert.equal(invocations.length, 1);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("a parent does not retry a child workflow after the child sends Gmail", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "lobster-composed-send-retry-"));
+	try {
+		const repoRoot = join(__dirname, "..", "..");
+		const mockGog = join(repoRoot, "test", "fixtures", "mock-gog-cancellation.mjs");
+		const childPath = join(dir, "child.lobster");
+		const parentPath = join(dir, "parent.lobster");
+		const sendStarted = join(dir, "send-started");
+		const sendInvocations = join(dir, "send-invocations");
+		await writeFile(
+			childPath,
+			JSON.stringify({
+				steps: [
+					{
+						id: "draft",
+						run: `${JSON.stringify(process.execPath)} -e "process.stdout.write(JSON.stringify({to:'user@example.com',subject:'Hello',body:'World'}))"`,
+					},
+					{ id: "send", pipeline: "gog.gmail.send", stdin: "$draft.json" },
+					{ id: "fail", run: `${JSON.stringify(process.execPath)} -e "process.exit(1)"` },
+				],
+			}),
+			"utf8",
+		);
+		await writeFile(
+			parentPath,
+			JSON.stringify({
+				steps: [
+					{
+						id: "child",
+						workflow: "./child.lobster",
+						retry: { max: 2, delay_ms: 0 },
+					},
+				],
+			}),
+			"utf8",
+		);
+
+		const result = await runToolRequest({
+			filePath: parentPath,
+			ctx: {
+				cwd: dir,
+				registry: createDefaultRegistry(),
+				env: {
+					...process.env,
+					LOBSTER_STATE_DIR: join(dir, "state"),
+					GOG_BIN: mockGog,
+					MOCK_GOG_SEND_STARTED_FILE: sendStarted,
+					MOCK_GOG_SEND_INVOCATIONS_FILE: sendInvocations,
+					MOCK_GOG_COMPLETION_DELAY_MS: "50",
+				},
+			},
+		});
+
+		assert.equal(result.ok, false);
+		assert.match(result.error?.message ?? "", /workflow command failed/);
+		const invocations = (await readFile(sendInvocations, "utf8")).trim().split(/\r?\n/);
+		assert.equal(invocations.length, 1);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("approval resume token cannot replay a send after downstream cancellation", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "lobster-resume-cancel-replay-"));
 	try {

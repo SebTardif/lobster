@@ -192,7 +192,23 @@ type RunContext = {
 	_onResumeStateResolved?: (stateKey: string) => void;
 	_onExecutionStarted?: () => void | Promise<void>;
 	_onExecutionInterrupted?: () => void;
+	_onNonRetryableSideEffect?: () => void;
 };
+
+const NON_RETRYABLE_STEP_ERROR = Symbol("lobster.nonRetryableStepError");
+
+function markStepErrorNonRetryable(error: unknown): Error {
+	const normalized = error instanceof Error ? error : new Error(String(error));
+	Object.defineProperty(normalized, NON_RETRYABLE_STEP_ERROR, { value: true });
+	return normalized;
+}
+
+function isStepErrorNonRetryable(error: unknown): boolean {
+	return Boolean(
+		error instanceof Error &&
+		(error as Error & { [NON_RETRYABLE_STEP_ERROR]?: boolean })[NON_RETRYABLE_STEP_ERROR],
+	);
+}
 
 const PARALLEL_BRANCH_ABORT_SETTLE_TIMEOUT_MS = 500;
 
@@ -1246,6 +1262,11 @@ export async function runWorkflowFile({
 				result: WorkflowStepResult;
 				parallelBranchResults: Record<string, WorkflowStepResult> | null;
 			}> => {
+				let attemptHadNonRetryableSideEffect = false;
+				const markNonRetryableSideEffect = () => {
+					attemptHadNonRetryableSideEffect = true;
+					ctx._onNonRetryableSideEffect?.();
+				};
 				ctx.signal?.throwIfAborted();
 				// Combine external cancellation and optional per-step timeout into one signal.
 				let stepSignal: AbortSignal | undefined = ctx.signal;
@@ -1347,7 +1368,11 @@ export async function runWorkflowFile({
 									stepId: branch.id,
 									pipelineText,
 									inputValue,
-									ctx: { ...ctx, signal: branchSignal },
+									ctx: {
+										...ctx,
+										signal: branchSignal,
+										_onNonRetryableSideEffect: markNonRetryableSideEffect,
+									},
 									llmSpendLedger: ledgerFor(branch.id),
 									env: branchEnv,
 									cwd: branchCwd,
@@ -1467,6 +1492,7 @@ export async function runWorkflowFile({
 								_onExecutionInterrupted: () => {
 									ctx._onExecutionInterrupted?.();
 								},
+								_onNonRetryableSideEffect: markNonRetryableSideEffect,
 							},
 						});
 						if (subResult.status === "needs_approval" || subResult.status === "needs_input") {
@@ -1524,7 +1550,11 @@ export async function runWorkflowFile({
 							stepId: step.id,
 							pipelineText,
 							inputValue,
-							ctx: { ...ctx, signal: stepSignal },
+							ctx: {
+								...ctx,
+								signal: stepSignal,
+								_onNonRetryableSideEffect: markNonRetryableSideEffect,
+							},
 							llmSpendLedger,
 							env,
 							cwd,
@@ -1545,6 +1575,11 @@ export async function runWorkflowFile({
 					}
 
 					return { result, parallelBranchResults };
+				} catch (error) {
+					if (attemptHadNonRetryableSideEffect) {
+						throw markStepErrorNonRetryable(error);
+					}
+					throw error;
 				} finally {
 					if (timeoutId !== undefined) clearTimeout(timeoutId);
 				}
@@ -1564,7 +1599,7 @@ export async function runWorkflowFile({
 									) {
 										return false;
 									}
-									if (stepTouchesEmailSend(step)) {
+									if (isStepErrorNonRetryable(error)) {
 										return false;
 									}
 									const message = error?.message ?? String(error);
@@ -2556,25 +2591,6 @@ function evaluateCondition(condition: unknown, results: Record<string, WorkflowS
 	if (trimmed === "true") return true;
 	if (trimmed === "false") return false;
 	return evaluateConditionExpression(trimmed, results);
-}
-
-function collectStepCommandText(step: WorkflowStep): string[] {
-	const texts: string[] = [];
-	if (typeof step.pipeline === "string") texts.push(step.pipeline);
-	if (typeof step.command === "string") texts.push(step.command);
-	if (typeof step.run === "string") texts.push(step.run);
-	for (const branch of step.parallel?.branches ?? []) {
-		if (typeof branch.pipeline === "string") texts.push(branch.pipeline);
-		if (typeof branch.command === "string") texts.push(branch.command);
-		if (typeof branch.run === "string") texts.push(branch.run);
-	}
-	return texts;
-}
-
-function stepTouchesEmailSend(step: WorkflowStep): boolean {
-	return collectStepCommandText(step).some((text) =>
-		/(^|[\s|])gog\.gmail\.send(?=$|[\s|])/.test(text),
-	);
 }
 
 function isApprovalStep(approval: WorkflowStep["approval"]) {
@@ -3635,6 +3651,7 @@ async function runPipelineStep({
 				}
 			: undefined,
 		onExecutionStart,
+		onNonRetryableSideEffect: ctx._onNonRetryableSideEffect,
 	});
 	stdout.end();
 	ctx.signal?.throwIfAborted();
