@@ -47,6 +47,7 @@ type SdkCommandInputResumeState = {
  * @typedef {Object} LobsterOptions
  * @property {Object} [env] - Environment variables
  * @property {string} [stateDir] - State directory override
+ * @property {AbortSignal} [signal] - Abort signal forwarded to pipeline stages
  */
 
 export class Lobster {
@@ -58,6 +59,7 @@ export class Lobster {
 		this.#options = {
 			env: options.env ?? process.env,
 			stateDir: options.stateDir,
+			signal: options.signal,
 		};
 	}
 
@@ -83,6 +85,7 @@ export class Lobster {
 			env: this.#options.env,
 			stateDir: this.#options.stateDir,
 			mode: "sdk",
+			signal: this.#options.signal,
 		};
 
 		try {
@@ -288,6 +291,7 @@ export class Lobster {
 			env: this.#options.env,
 			stateDir: this.#options.stateDir,
 			mode: "sdk",
+			signal: this.#options.signal,
 		};
 
 		try {

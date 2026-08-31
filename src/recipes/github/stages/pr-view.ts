@@ -10,7 +10,7 @@
  *   .pipe(pr => console.log(pr.state));
  */
 
-import { spawn } from "node:child_process";
+import { runAbortableProcess } from "../../../abortable_process.js";
 
 /**
  * Run gh command
@@ -18,43 +18,20 @@ import { spawn } from "node:child_process";
  * @param {Object} options
  * @returns {Promise<{stdout: string, stderr: string}>}
  */
-function runGh(argv, { env, cwd }) {
-	return new Promise<any>((resolve, reject) => {
-		const child = spawn("gh", argv, {
-			env,
-			cwd,
-			stdio: ["ignore", "pipe", "pipe"],
-		});
-
-		let stdout = "";
-		let stderr = "";
-
-		child.stdout.setEncoding("utf8");
-		child.stderr.setEncoding("utf8");
-
-		child.stdout.on("data", (d) => {
-			stdout += d;
-		});
-		child.stderr.on("data", (d) => {
-			stderr += d;
-		});
-
-		child.on("error", (err: any) => {
-			if (err?.code === "ENOENT") {
-				reject(new Error("gh not found on PATH (install GitHub CLI)"));
-				return;
-			}
-			reject(err);
-		});
-
-		child.on("close", (code) => {
-			if (code === 0) {
-				resolve({ stdout, stderr });
-			} else {
-				reject(new Error(`gh failed (${code}): ${stderr.trim() || stdout.trim()}`));
-			}
-		});
+async function runGh(argv, { env, cwd, signal, forceTerminationSignal }) {
+	const { stdout, stderr, code } = await runAbortableProcess({
+		command: "gh",
+		argv,
+		env,
+		cwd,
+		signal,
+		forceTerminationSignal,
+		notFoundMessage: "gh not found on PATH (install GitHub CLI)",
 	});
+	if (code === 0) {
+		return { stdout, stderr };
+	}
+	throw new Error(`gh failed (${code}): ${stderr.trim() || stdout.trim()}`);
 }
 
 /**
@@ -98,7 +75,12 @@ export function ghPrView(options) {
 
 			const argv = ["pr", "view", String(pr), "--repo", String(repo), "--json", fields.join(",")];
 
-			const { stdout } = (await runGh(argv, { env: ctx.env, cwd: process.cwd() })) as any;
+			const { stdout } = (await runGh(argv, {
+				env: ctx.env,
+				cwd: process.cwd(),
+				signal: ctx.signal,
+				forceTerminationSignal: ctx.forceTerminationSignal,
+			})) as any;
 
 			let parsed;
 			try {
