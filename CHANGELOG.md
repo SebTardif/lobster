@@ -5,7 +5,7 @@ All notable changes to Lobster will be documented in this file.
 ## Unreleased
 
 - Honor SDK cancellation in `exec()` and shell commands, including constructor signals on run, clone, and resume. Thanks to [@SebTardif](https://github.com/SebTardif) (PR [#144](https://github.com/openclaw/lobster/pull/144)).
-
+- Refresh Node.js type definitions and Oxc tooling, and align development, CI hydration, and release tooling on pnpm 11.25.0.
 - Run Node 24 CI on pull requests and pushes to `main`, checking workflow syntax, frozen dependency installation, build, types, formatting, lint, and tests.
 - Preserve a replacement state lock when the filesystem reuses the stale lock's inode, preventing overlapping state writers.
 - Refresh development tooling and the `fast-uri` override, align pnpm on 11.24.0, and update GitHub Actions.
