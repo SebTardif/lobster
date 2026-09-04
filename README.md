@@ -167,6 +167,18 @@ From this folder:
 
 - OpenClaw integration: ship as an optional OpenClaw plugin tool.
 
+## GitHub recipe cancellation
+
+The SDK GitHub recipes accept an `AbortSignal` in both
+`prMonitor({ repo, pr, signal })` and `prMonitorNotify({ repo, pr, signal })`.
+Aborting stops the running GitHub CLI child before the recipe returns an error
+result containing the abort reason. A cancelled fetch does not update the saved
+PR snapshot or emit a notification.
+
+For a manually composed pipeline, pass the signal to
+`new Lobster({ signal }).pipe(ghPrView({ repo, pr }))`. Custom stages receive
+`ctx.signal` and must cooperate with it to cancel their own work.
+
 ## Workflow files
 
 Lobster workflow files are meant to read like small scripts:

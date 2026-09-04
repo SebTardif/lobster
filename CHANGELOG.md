@@ -4,6 +4,8 @@ All notable changes to Lobster will be documented in this file.
 
 ## Unreleased
 
+- Honor cancellation in `ghPrView()` and both exported GitHub monitor recipes, stopping the GitHub CLI before returning an error. Thanks to [@SebTardif](https://github.com/SebTardif) (PR [#145](https://github.com/openclaw/lobster/pull/145)).
+
 - Run Node 24 CI on pull requests and pushes to `main`, checking workflow syntax, frozen dependency installation, build, types, formatting, lint, and tests.
 - Preserve a replacement state lock when the filesystem reuses the stale lock's inode, preventing overlapping state writers.
 - Refresh development tooling and the `fast-uri` override, align pnpm on 11.24.0, and update GitHub Actions.

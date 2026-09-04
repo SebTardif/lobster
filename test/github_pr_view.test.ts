@@ -1,13 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import { spawnSync } from "node:child_process";
-import { access, chmod, copyFile, mkdtemp, readFile, rm } from "node:fs/promises";
+import { access, chmod, copyFile, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { Lobster } from "../src/sdk/Lobster.js";
-import { ghPrView } from "../src/recipes/github/index.js";
+import { ghPrView, prMonitor, prMonitorNotify } from "../src/recipes/github/index.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -153,3 +154,57 @@ test(
 		}
 	},
 );
+
+for (const recipe of [prMonitor, prMonitorNotify]) {
+	test(
+		`${recipe.name} cancels its child without saving a snapshot`,
+		{ skip: process.platform === "win32" },
+		async () => {
+			const dir = await mkdtemp(join(tmpdir(), `lobster-${recipe.name}-abort-`));
+			const controller = new AbortController();
+			const envBefore = { ...process.env };
+			let pending: Promise<any> | undefined;
+			try {
+				const ghBin = join(dir, "gh");
+				await copyFile(
+					join(__dirname, "..", "..", "test", "fixtures", "mock-gh-cancellation.mjs"),
+					ghBin,
+				);
+				await chmod(ghBin, 0o755);
+				const started = join(dir, "started");
+				const terminated = join(dir, "terminated");
+				const completed = join(dir, "completed");
+				Object.assign(process.env, {
+					PATH: `${dir}:${process.env.PATH ?? ""}`,
+					LOBSTER_STATE_DIR: join(dir, "state"),
+					MOCK_GH_STARTED_FILE: started,
+					MOCK_GH_TERMINATED_FILE: terminated,
+					MOCK_GH_COMPLETED_FILE: completed,
+					MOCK_GH_TERMINATION_DELAY_MS: "50",
+					MOCK_GH_COMPLETION_DELAY_MS: "5000",
+				});
+				pending = recipe({ repo: "example/repo", pr: 1, signal: controller.signal }).run();
+				await waitForFile(started);
+				const pid = Number((await readFile(started, "utf8")).trim());
+				controller.abort(new Error(`cancel ${recipe.name}`));
+				const result = await pending;
+				assert.equal(result.ok, false);
+				assert.equal(result.error.message, `cancel ${recipe.name}`);
+				assert.deepEqual(result.output, []);
+				assert.equal(processIsRunning(pid), false, "result must wait for child exit");
+				assert.equal(await fileExists(terminated), true);
+				assert.equal(await fileExists(completed), false);
+				assert.deepEqual(await readdir(join(dir, "state")).catch(() => []), []);
+				assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+			} finally {
+				controller.abort();
+				await pending;
+				for (const key of Object.keys(process.env)) {
+					if (!(key in envBefore)) delete process.env[key];
+				}
+				Object.assign(process.env, envBefore);
+				await rm(dir, { recursive: true, force: true });
+			}
+		},
+	);
+}

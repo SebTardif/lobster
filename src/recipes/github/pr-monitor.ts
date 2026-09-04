@@ -88,6 +88,7 @@ function formatChangeMessage({ repo, pr, changedFields, prInfo }) {
  * @param {string} [options.key] - State key override
  * @param {boolean} [options.changesOnly=false] - Only output when changed
  * @param {boolean} [options.summaryOnly=false] - Return compact summary
+ * @param {AbortSignal} [options.signal] - Cancel the running GitHub command
  * @returns {Lobster}
  */
 export function prMonitor(options) {
@@ -97,7 +98,7 @@ export function prMonitor(options) {
 	if (!repo) throw new Error("prMonitor requires repo");
 	if (!pr) throw new Error("prMonitor requires pr");
 
-	const workflow = new Lobster()
+	const workflow = new Lobster({ signal: options.signal })
 		.pipe(ghPrView({ repo, pr }))
 		.pipe(diffLast(key))
 		.pipe((results) => {
@@ -192,6 +193,7 @@ prMonitor.meta = {
  * @param {string} options.repo - Repository in owner/repo format
  * @param {number} options.pr - PR number
  * @param {string} [options.key] - State key override
+ * @param {AbortSignal} [options.signal] - Cancel the running GitHub command
  * @returns {Lobster}
  */
 export function prMonitorNotify(options) {
@@ -201,7 +203,7 @@ export function prMonitorNotify(options) {
 	if (!repo) throw new Error("prMonitorNotify requires repo");
 	if (!pr) throw new Error("prMonitorNotify requires pr");
 
-	const workflow = new Lobster()
+	const workflow = new Lobster({ signal: options.signal })
 		.pipe(ghPrView({ repo, pr }))
 		.pipe(diffLast(key, { changesOnly: true }))
 		.pipe((results) => {
