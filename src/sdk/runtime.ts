@@ -146,7 +146,7 @@ export async function runPipeline({
 	env,
 	mode = "human",
 	input,
-	signal,
+	signal = undefined,
 	requestInputResume = undefined,
 	requestInputEnabled = true,
 }) {

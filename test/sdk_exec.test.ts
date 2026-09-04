@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import { spawnSync } from "node:child_process";
 import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -7,6 +8,7 @@ import { join } from "node:path";
 
 import { Lobster } from "../src/sdk/Lobster.js";
 import { exec, shell } from "../src/sdk/primitives/exec.js";
+import { approve, runPipeline } from "../src/sdk/index.js";
 
 function emptyInput() {
 	return (async function* () {})();
@@ -134,5 +136,96 @@ test("public Lobster pipe run forwards constructor abort signal", async () => {
 		await waitUntilStopped(pid);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+for (const entry of ["clone", "resume"] as const) {
+	test(`SDK ${entry} preserves the signal and waits for child cleanup`, async () => {
+		const dir = await mkdtemp(join(tmpdir(), `lobster-sdk-${entry}-abort-`));
+		const controller = new AbortController();
+		let pending: Promise<any> | undefined;
+		try {
+			const pidFile = join(dir, "pid");
+			const workflow = new Lobster({
+				env: { ...process.env, LOBSTER_EXEC_PID_FILE: pidFile },
+				signal: controller.signal,
+			});
+			if (entry === "resume") workflow.pipe(approve());
+			workflow.pipe(exec(longChildCommand(), { shell: true, json: false }));
+			if (entry === "resume") {
+				const first = await workflow.run();
+				assert.equal(first.status, "needs_approval");
+				pending = workflow.resume(first.requiresApproval!.resumeToken, { approved: true });
+			} else {
+				pending = workflow.clone().run();
+			}
+			await waitForFile(pidFile);
+			const pid = Number((await readFile(pidFile, "utf8")).trim());
+			controller.abort(new Error(`cancel ${entry}`));
+			const result = await pending;
+			assert.equal(result.ok, false);
+			assert.equal(result.error.message, `cancel ${entry}`);
+			assert.equal(processIsRunning(pid), false, "result must wait for process exit");
+			assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+		} finally {
+			controller.abort();
+			await pending;
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+}
+
+test("pre-aborted SDK exec never starts a child", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "lobster-sdk-preabort-"));
+	try {
+		const controller = new AbortController();
+		controller.abort(new Error("already cancelled"));
+		const result = await new Lobster({
+			env: { ...process.env, LOBSTER_EXEC_PID_FILE: join(dir, "pid") },
+			signal: controller.signal,
+		})
+			.pipe(exec(longChildCommand(), { json: false }))
+			.run();
+		assert.equal(result.ok, false);
+		assert.equal(result.error.message, "already cancelled");
+		await assert.rejects(access(join(dir, "pid")), { code: "ENOENT" });
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("SDK exec preserves output and failure handling and releases abort listeners", async () => {
+	const controller = new AbortController();
+	const run = (command: string) =>
+		new Lobster({ signal: controller.signal }).pipe(exec(command)).run();
+	const success = await run(`${quote(process.execPath)} -e ${quote('console.log("[1,2]")')}`);
+	assert.deepEqual(success.output, [1, 2]);
+	const failed = await run(
+		`${quote(process.execPath)} -e ${quote('console.error("failed");process.exit(7)')}`,
+	);
+	assert.equal(failed.ok, false);
+	assert.match(failed.error.message, /exited with code 7: failed/);
+	const missing = await run("lobster-nonexistent-executable-for-test");
+	assert.equal(missing.ok, false);
+	assert.match(missing.error.message, /Failed to execute .* ENOENT/);
+	assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+});
+
+test("exported SDK runPipeline keeps signal optional and forwards supplied signals", async () => {
+	const controller = new AbortController();
+	for (const options of [{}, { signal: controller.signal }]) {
+		const result = await runPipeline({
+			pipeline: [{ name: "signal", args: {} }],
+			registry: {
+				get: () => ({ run: ({ ctx }: any) => ({ output: [ctx.signal === options.signal] }) }),
+			},
+			stdin: { isTTY: false },
+			stdout: { write() {} },
+			stderr: { write() {} },
+			env: process.env,
+			input: [],
+			...options,
+		});
+		assert.deepEqual(result.items, [true]);
 	}
 });

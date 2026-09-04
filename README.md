@@ -167,6 +167,29 @@ From this folder:
 
 - OpenClaw integration: ship as an optional OpenClaw plugin tool.
 
+## SDK cancellation
+
+Pass an `AbortSignal` to `new Lobster({ signal })` to cancel SDK `exec()` stages,
+including `exec(command, { shell: true })`. The signal is retained by `clone()`
+and forwarded when a pipeline resumes. Aborting terminates the running child
+process tree before `run()` or `resume()` returns an error result containing the
+abort reason. A signal that is already aborted prevents the command from starting.
+
+```js
+import { Lobster, exec } from '@clawdbot/lobster';
+
+const controller = new AbortController();
+const pending = new Lobster({ signal: controller.signal })
+  .pipe(exec('node long-task.js', { json: false }))
+  .run();
+// When the host needs to stop the command:
+controller.abort(new Error('Host cancelled the command'));
+const result = await pending;
+```
+
+Custom stages receive the signal as `ctx.signal` and must cooperate with it to
+cancel their own work.
+
 ## Workflow files
 
 Lobster workflow files are meant to read like small scripts:
