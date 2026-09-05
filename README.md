@@ -155,6 +155,39 @@ From this folder:
 
 - `pnpm test` runs `tsc` and then executes tests against `dist/`.
 - `bin/lobster.js` prefers the compiled entrypoint in `dist/` when present.
+## Process output limits
+
+Captured process stdout and stderr remain unlimited by default. Set
+`LOBSTER_MAX_OUTPUT_BYTES` to a positive integer to opt into a byte limit **per
+stream, per process**. Unset or empty means unlimited; zero, negative, fractional,
+and non-numeric values are rejected before a process starts. This applies to
+CLI `exec`, workflow shell steps, SDK `exec`/shell calls, GitHub recipes, and Gog
+commands. The existing `openclaw.agent` 10 MiB limit remains in place; an opted-in
+limit can lower it.
+
+```bash
+LOBSTER_MAX_OUTPUT_BYTES=1048576 lobster run --mode tool 'exec my-command'
+```
+
+Use workflow or step `env` to scope the limit:
+
+```yaml
+steps:
+  - id: bounded
+    env:
+      LOBSTER_MAX_OUTPUT_BYTES: "1048576"
+    run: my-command
+```
+
+SDK callers set the same variable in `new Lobster({ env: { ...process.env,
+LOBSTER_MAX_OUTPUT_BYTES: "1048576" } })`. Values exactly at the limit succeed;
+overflow terminates the process tree and returns an error without partial
+output. POSIX capped calls own a process group so background producers cannot
+keep pipes open after overflow. Calls without an AbortSignal relay terminal
+interrupts to that group and retain the host's existing signal handlers or
+conventional interrupt exit status.
+
+
 ## Commands
 
 - `exec`: run OS commands
@@ -405,35 +438,3 @@ steps:
     command: |
       jq -n --arg text "$TEXT" '{"result": $text}'
 ```
-
-## Process output limits
-
-Captured process stdout and stderr remain unlimited by default. Set
-`LOBSTER_MAX_OUTPUT_BYTES` to a positive integer to opt into a byte limit **per
-stream, per process**. Unset or empty means unlimited; zero, negative, fractional,
-and non-numeric values are rejected before a process starts. This applies to
-CLI `exec`, workflow shell steps, SDK `exec`/shell calls, GitHub recipes, and Gog
-commands. The existing `openclaw.agent` 10 MiB limit remains in place; an opted-in
-limit can lower it.
-
-```bash
-LOBSTER_MAX_OUTPUT_BYTES=1048576 lobster run --mode tool 'exec my-command'
-```
-
-Use workflow or step `env` to scope the limit:
-
-```yaml
-steps:
-  - id: bounded
-    env:
-      LOBSTER_MAX_OUTPUT_BYTES: "1048576"
-    run: my-command
-```
-
-SDK callers set the same variable in `new Lobster({ env: { ...process.env,
-LOBSTER_MAX_OUTPUT_BYTES: "1048576" } })`. Values exactly at the limit succeed;
-overflow terminates the process tree and returns an error without partial
-output. POSIX capped calls own a process group so background producers cannot
-keep pipes open after overflow. Calls without an AbortSignal relay terminal
-interrupts to that group and retain the host's existing signal handlers or
-conventional interrupt exit status.

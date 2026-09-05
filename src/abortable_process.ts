@@ -27,7 +27,8 @@ function registerInterruptTarget(target: InterruptTarget): () => void {
 				});
 			};
 			interruptHandlers.set(signal, handler);
-			process.on(signal, handler);
+			// Observe existing once-handlers before EventEmitter removes them.
+			process.prependListener(signal, handler);
 		}
 	}
 	interruptTargets.add(target);

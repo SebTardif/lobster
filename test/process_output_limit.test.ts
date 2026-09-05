@@ -114,7 +114,7 @@ function isAlive(pid: number) {
 	return stat !== "" && !stat.startsWith("Z");
 }
 
-for (const mode of ["overflow", "interrupt", "host-handler", "host-exit"]) {
+for (const mode of ["overflow", "interrupt", "host-handler", "once-handler", "host-exit"]) {
 	test(
 		`capped no-signal SDK shell cleans its background producer on ${mode}`,
 		{ skip: process.platform === "win32", timeout: 15_000 },
@@ -138,7 +138,7 @@ setInterval(()=>{${mode === "overflow" ? "process.stdout.write('x'.repeat(2048))
 				await writeFile(
 					runner,
 					`import {Lobster,exec} from ${quote(new URL("../src/sdk/index.js", import.meta.url).href)};
-${mode === "host-handler" ? "process.on('SIGINT',()=>console.log('host handled SIGINT'));" : ""}
+${mode === "host-handler" || mode === "once-handler" ? `process.${mode === "once-handler" ? "once" : "on"}('SIGINT',()=>console.log('host handled SIGINT'));` : ""}
 ${mode === "host-exit" ? "process.on('SIGUSR2',()=>process.exit(0));" : ""}
 const result=await new Lobster({env:{...process.env,LOBSTER_MAX_OUTPUT_BYTES:'1024'}})
 .pipe(exec(${quote(`${quote(process.execPath)} ${quote(producer)} & wait`)},{shell:true,json:false})).run();
@@ -154,7 +154,8 @@ console.log(JSON.stringify(result));`,
 				wrapper.stderr!.on("data", (x) => (stderr += x));
 				const closed = new Promise<number | null>((resolve) => wrapper!.once("close", resolve));
 				pid = await waitForPid(marker);
-				if (mode === "interrupt" || mode === "host-handler") wrapper.kill("SIGINT");
+				if (mode === "interrupt" || mode === "host-handler" || mode === "once-handler")
+					wrapper.kill("SIGINT");
 				if (mode === "host-exit") wrapper.kill("SIGUSR2");
 				let timer: ReturnType<typeof setTimeout>;
 				const code = await Promise.race([
@@ -166,8 +167,9 @@ console.log(JSON.stringify(result));`,
 				assert.equal(code, mode === "interrupt" ? 130 : 0, stderr);
 				assert.equal(isAlive(pid), false, "producer must not survive its owner");
 				if (mode === "overflow") assert.match(stdout, /Process output exceeded 1024 bytes/);
-				if (mode === "host-handler") assert.match(stdout, /host handled SIGINT/);
-				if (mode === "interrupt" || mode === "host-handler")
+				if (mode === "host-handler" || mode === "once-handler")
+					assert.match(stdout, /host handled SIGINT/);
+				if (mode === "interrupt" || mode === "host-handler" || mode === "once-handler")
 					assert.equal(await readFile(received, "utf8"), "SIGINT");
 			} finally {
 				if (pid) {
