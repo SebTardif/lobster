@@ -1,7 +1,8 @@
 import test from "node:test";
+import { waitForPid } from "./helpers/wait_for_pid.js";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import { access, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,15 +27,6 @@ async function fileExists(path: string) {
 	}
 }
 
-async function waitForFile(path: string, timeoutMs = 5000) {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (await fileExists(path)) return;
-		await new Promise((resolve) => setTimeout(resolve, 10));
-	}
-	throw new Error(`Timed out waiting for ${path}`);
-}
-
 function processIsRunning(pid: number) {
 	try {
 		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
@@ -53,6 +45,8 @@ function processIsRunning(pid: number) {
 
 test("aborting gog.gmail.send terminates the sleeper gog child", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "lobster-gmail-send-abort-"));
+	const controller = new AbortController();
+	let run: Promise<any> | undefined;
 	try {
 		const repoRoot = join(__dirname, "..", "..");
 		const mockGog = join(repoRoot, "test", "fixtures", "mock-gog-cancellation.mjs");
@@ -61,9 +55,8 @@ test("aborting gog.gmail.send terminates the sleeper gog child", async () => {
 		const sendCompleted = join(dir, "send-completed");
 		const descendantStarted = join(dir, "descendant-started");
 		const descendantCompleted = join(dir, "descendant-completed");
-		const controller = new AbortController();
 
-		const run = gogGmailSendCommand.run({
+		run = gogGmailSendCommand.run({
 			input: streamOf([{ to: "user@example.com", subject: "Hello", body: "World" }]),
 			args: {},
 			ctx: {
@@ -82,10 +75,8 @@ test("aborting gog.gmail.send terminates the sleeper gog child", async () => {
 			},
 		});
 
-		await waitForFile(sendStarted);
-		await waitForFile(descendantStarted);
-		const childPid = Number(await readFile(sendStarted, "utf8"));
-		const descendantPid = Number(await readFile(descendantStarted, "utf8"));
+		const childPid = await waitForPid(sendStarted);
+		const descendantPid = await waitForPid(descendantStarted);
 		assert.ok(Number.isInteger(childPid) && childPid > 0);
 		assert.ok(Number.isInteger(descendantPid) && descendantPid > 0);
 		controller.abort(new Error("abort in-flight gog.gmail.send"));
@@ -113,6 +104,8 @@ test("aborting gog.gmail.send terminates the sleeper gog child", async () => {
 			"a send descendant must not finish after abort",
 		);
 	} finally {
+		controller.abort();
+		await run?.catch(() => {});
 		await rm(dir, { recursive: true, force: true });
 	}
 });
