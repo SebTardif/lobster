@@ -1,8 +1,55 @@
 import { spawn, type ChildProcess, type SpawnOptionsWithoutStdio } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import { resolveInlineShellCommand } from "./shell.js";
 
 const ABORT_FORCE_KILL_AFTER_MS = 250;
 const forceTerminationCallbacks = new WeakMap<AbortSignal, Set<() => void>>();
+
+// Capped direct SDK calls have no host AbortSignal, but their isolated children
+// must still receive terminal interrupts and be killed if the host exits.
+const interruptSignals = { SIGINT: 130, SIGTERM: 143, SIGHUP: 129, SIGQUIT: 131 } as const;
+type InterruptSignal = keyof typeof interruptSignals;
+type InterruptTarget = { stop: (signal: InterruptSignal) => Promise<void>; kill: () => void };
+const interruptTargets = new Set<InterruptTarget>();
+const interruptHandlers = new Map<InterruptSignal, () => void>();
+const killOnExit = () => {
+	for (const target of interruptTargets) target.kill();
+};
+
+function registerInterruptTarget(target: InterruptTarget): () => void {
+	if (interruptTargets.size === 0) {
+		process.on("exit", killOnExit);
+		for (const signal of Object.keys(interruptSignals) as InterruptSignal[]) {
+			const handler = () => {
+				const defaultExit = process.listenerCount(signal) === 1;
+				void Promise.allSettled([...interruptTargets].map((item) => item.stop(signal))).then(() => {
+					if (defaultExit) process.exit(interruptSignals[signal]);
+				});
+			};
+			interruptHandlers.set(signal, handler);
+			process.on(signal, handler);
+		}
+	}
+	interruptTargets.add(target);
+	return () => {
+		interruptTargets.delete(target);
+		if (interruptTargets.size === 0) {
+			process.removeListener("exit", killOnExit);
+			for (const [signal, handler] of interruptHandlers) process.removeListener(signal, handler);
+			interruptHandlers.clear();
+		}
+	};
+}
+
+function outputLimitFromEnv(env: NodeJS.ProcessEnv): number | undefined {
+	const raw = env.LOBSTER_MAX_OUTPUT_BYTES?.trim();
+	if (!raw) return undefined;
+	const value = Number(raw);
+	if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value <= 0) {
+		throw new Error("LOBSTER_MAX_OUTPUT_BYTES must be a positive safe integer (bytes)");
+	}
+	return value;
+}
 
 type ProcessResult = {
 	stdout: string;
@@ -72,18 +119,25 @@ export function runAbortableProcess(options: RunAbortableProcessOptions): Promis
 		signal,
 		forceTerminationSignal,
 		killSignal,
-		maxOutputBytes,
+		maxOutputBytes: requestedMaxOutputBytes,
 		outputLimitMessage,
 		notFoundMessage,
 	} = options;
 	return new Promise((resolve, reject) => {
 		if (
-			maxOutputBytes !== undefined &&
-			(!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 0)
+			requestedMaxOutputBytes !== undefined &&
+			(!Number.isSafeInteger(requestedMaxOutputBytes) || requestedMaxOutputBytes < 0)
 		) {
 			reject(new Error("maxOutputBytes must be a non-negative safe integer"));
 			return;
 		}
+		const envLimit = outputLimitFromEnv(env);
+		const maxOutputBytes =
+			envLimit === undefined
+				? requestedMaxOutputBytes
+				: requestedMaxOutputBytes === undefined
+					? envLimit
+					: Math.min(envLimit, requestedMaxOutputBytes);
 		try {
 			signal?.throwIfAborted();
 		} catch (err) {
@@ -95,10 +149,9 @@ export function runAbortableProcess(options: RunAbortableProcessOptions): Promis
 			cwd,
 			shell: false,
 			stdio: "pipe",
-			// Create a dedicated POSIX process group only when this runner owns a
-			// cancellation signal for it. Direct APIs without one must retain the
-			// caller's terminal process group so Ctrl-C still reaches their child.
-			detached: process.platform !== "win32" && signal !== undefined,
+			// A finite cap also owns termination, including background descendants.
+			detached:
+				process.platform !== "win32" && (signal !== undefined || maxOutputBytes !== undefined),
 		};
 		// Keep direct argv and shell command dataflow at distinct spawn sites.
 		// Merging them makes shell interpretation leak into direct executable callers.
@@ -110,6 +163,8 @@ export function runAbortableProcess(options: RunAbortableProcessOptions): Promis
 					})()
 				: spawn(options.command, options.argv, spawnOptions);
 
+		const stdoutDecoder = new StringDecoder("utf8");
+		const stderrDecoder = new StringDecoder("utf8");
 		let stdout = "";
 		let stderr = "";
 		let stdoutBytes = 0;
@@ -122,7 +177,14 @@ export function runAbortableProcess(options: RunAbortableProcessOptions): Promis
 		let settled = false;
 		const forceTerminationRegistrations: Set<() => void>[] = [];
 		let forceTerminate: (() => void) | undefined;
+		let unregisterInterruptTarget: (() => void) | undefined;
+		let resolveStopped: () => void;
+		const stopped = new Promise<void>((resolve) => {
+			resolveStopped = resolve;
+		});
 		const cleanup = () => {
+			unregisterInterruptTarget?.();
+			resolveStopped();
 			signal?.removeEventListener("abort", onAbort);
 			if (forceKillTimer) clearTimeout(forceKillTimer);
 			if (forceTerminate) {
@@ -149,11 +211,13 @@ export function runAbortableProcess(options: RunAbortableProcessOptions): Promis
 				failTerminationWhenTreeIsStopped();
 			});
 		};
-		const startTermination = (error: Error) => {
+		const startTermination = (error: Error, receivedSignal?: NodeJS.Signals) => {
 			if (settled || terminationError) return;
 			terminationError = error;
 			const initialKillSignal =
-				(typeof killSignal === "function" ? killSignal() : killSignal) ?? "SIGTERM";
+				receivedSignal ??
+				(typeof killSignal === "function" ? killSignal() : killSignal) ??
+				"SIGTERM";
 			if (initialKillSignal === "SIGKILL") {
 				forceKill();
 				return;
@@ -179,28 +243,30 @@ export function runAbortableProcess(options: RunAbortableProcessOptions): Promis
 			if (!signal) return;
 			startTermination(abortError(signal));
 		};
-		const appendOutput = (stream: "stdout" | "stderr", data: string) => {
-			const bytes = Buffer.byteLength(data);
+		const appendOutput = (stream: "stdout" | "stderr", data: Buffer) => {
+			if (terminationError || settled) return;
+			const bytes = data.byteLength;
 			const total = stream === "stdout" ? stdoutBytes + bytes : stderrBytes + bytes;
 			if (maxOutputBytes !== undefined && total > maxOutputBytes) {
 				startTermination(
-					new Error(outputLimitMessage ?? `Process output exceeded ${maxOutputBytes} bytes`),
+					new Error(
+						(maxOutputBytes === requestedMaxOutputBytes ? outputLimitMessage : undefined) ??
+							`Process output exceeded ${maxOutputBytes} bytes`,
+					),
 				);
 				return;
 			}
 			if (stream === "stdout") {
 				stdoutBytes = total;
-				stdout += data;
+				stdout += stdoutDecoder.write(data);
 			} else {
 				stderrBytes = total;
-				stderr += data;
+				stderr += stderrDecoder.write(data);
 			}
 		};
 
-		child.stdout?.setEncoding("utf8");
-		child.stderr?.setEncoding("utf8");
-		child.stdout?.on("data", (data: string) => appendOutput("stdout", data));
-		child.stderr?.on("data", (data: string) => appendOutput("stderr", data));
+		child.stdout?.on("data", (data: Buffer) => appendOutput("stdout", data));
+		child.stderr?.on("data", (data: Buffer) => appendOutput("stderr", data));
 		child.stdin?.on("error", () => {});
 		if (typeof stdin === "string") child.stdin?.write(stdin);
 		child.stdin?.end();
@@ -226,7 +292,7 @@ export function runAbortableProcess(options: RunAbortableProcessOptions): Promis
 			}
 			settled = true;
 			cleanup();
-			resolve({ stdout, stderr, code });
+			resolve({ stdout: stdout + stdoutDecoder.end(), stderr: stderr + stderrDecoder.end(), code });
 		});
 
 		for (const registrationSignal of new Set(
@@ -241,6 +307,25 @@ export function runAbortableProcess(options: RunAbortableProcessOptions): Promis
 			}
 			listeners.add(forceTerminate);
 			forceTerminationRegistrations.push(listeners);
+		}
+
+		if (spawnOptions.detached && signal === undefined) {
+			unregisterInterruptTarget = registerInterruptTarget({
+				stop(receivedSignal) {
+					if (terminationError) forceKill();
+					else startTermination(new Error(`Received ${receivedSignal}`), receivedSignal);
+					return stopped;
+				},
+				kill() {
+					if (child.pid) {
+						try {
+							process.kill(-child.pid, "SIGKILL");
+						} catch {
+							/* Already exited. */
+						}
+					}
+				},
+			});
 		}
 
 		if (signal) {
