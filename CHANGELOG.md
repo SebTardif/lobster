@@ -4,6 +4,8 @@ All notable changes to Lobster will be documented in this file.
 
 ## Unreleased
 
+- Prevent automatic workflow retries after dispatching `openclaw.invoke`, `clawd.invoke`, or `openclaw.agent`, avoiding duplicate remote actions after timeouts or failures. Thanks to [@SebTardif](https://github.com/SebTardif) (PR [#153](https://github.com/openclaw/lobster/pull/153)).
+
 - Honor cancellation in `ghPrView()` and both exported GitHub monitor recipes, stopping the GitHub CLI before returning an error. Thanks to [@SebTardif](https://github.com/SebTardif) (PR [#145](https://github.com/openclaw/lobster/pull/145)).
 - Honor SDK cancellation in `exec()` and shell commands, including constructor signals on run, clone, and resume. Thanks to [@SebTardif](https://github.com/SebTardif) (PR [#144](https://github.com/openclaw/lobster/pull/144)).
 - Refresh Node.js type definitions and Oxc tooling, and align development, CI hydration, and release tooling on pnpm 11.25.0.

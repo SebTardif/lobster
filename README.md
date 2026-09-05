@@ -253,6 +253,10 @@ Notes:
   - `LOBSTER_APPROVAL_INITIATED_BY` can provide a default initiator id at run time.
   - `LOBSTER_APPROVAL_APPROVED_BY` is used at resume/approval time for identity checks.
 
+### Retries after OpenClaw dispatch
+
+`openclaw.invoke` (including `clawd.invoke`) and `openclaw.agent` suppress automatic workflow-step retries once dispatch is attempted. This applies to timeouts, HTTP or process failures, and errors in later commands of the same pipeline step, even when `retry.max` is greater than one. A failed local request cannot establish whether a remote action already completed. Read-only and dry-run requests use the same conservative rule: Lobster does not know the remote tool’s retry guarantees, and the [OpenClaw gateway currently ignores `dryRun`](https://docs.openclaw.ai/gateway/tools-invoke-http-api#request-body). The flag does not prevent tool execution. Check the remote outcome before manually running the step again. `llm.invoke` retains its existing retry policy.
+
 ### Command-level input requests
 
 Pipeline commands can call `ctx.requestInput({ prompt, responseSchema, defaults, subject, suspendedState })` to pause in tool mode, workflows, or the SDK and resume the same command after a structured response. CLI/tool resume tokens store only a state key; the persisted state validates the suspended request metadata before returning the submitted response to the command. SDK same-command resumes store the command frame in the configured SDK state directory.

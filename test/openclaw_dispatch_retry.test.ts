@@ -1,286 +1,108 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { promises as fsp } from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { PassThrough } from "node:stream";
+import { promisify } from "node:util";
 
-import { createDefaultRegistry } from "../src/commands/registry.js";
-import { createOpenClawAgentCommand } from "../src/commands/stdlib/openclaw_agent.js";
-import { runWorkflowFile } from "../src/workflows/file.js";
+const execFileAsync = promisify(execFile);
+const cli = path.resolve("bin/lobster.js");
 
-type Registry = ReturnType<typeof createDefaultRegistry>;
-
-function withCommands(defaultRegistry: Registry, ...commands: Array<{ name: string }>) {
-	return {
-		get(name: string) {
-			return commands.find((command) => command.name === name) ?? defaultRegistry.get(name);
-		},
-	};
-}
-
-async function hangUntilAbort(signal?: AbortSignal): Promise<never> {
-	await new Promise<never>((_resolve, reject) => {
-		const fail = () => {
-			reject(signal?.reason ?? new DOMException("The operation was aborted.", "AbortError"));
-		};
-		if (signal?.aborted) {
-			fail();
-			return;
-		}
-		signal?.addEventListener("abort", fail, { once: true });
-	});
-	throw new Error("unreachable");
-}
-
-async function listen(server: http.Server): Promise<number> {
-	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
-	const address = server.address();
-	if (!address || typeof address === "string") {
-		throw new Error("Missing server address");
-	}
-	return address.port;
-}
-
-function hangingInvokeServer() {
-	let hits = 0;
-	const server = http.createServer((_req, _res) => {
-		hits += 1;
-	});
-	return {
-		server,
-		get hits() {
-			return hits;
-		},
-	};
-}
-
-async function runWorkflow(
-	workflow: unknown,
-	opts?: { registry?: { get: (name: string) => unknown }; env?: NodeJS.ProcessEnv },
-) {
-	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-dispatch-retry-"));
-	const stateDir = path.join(tmpDir, "state");
-	const filePath = path.join(tmpDir, "workflow.lobster");
-	await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
-
-	const stderr = new PassThrough();
-	const chunks: string[] = [];
-	stderr.on("data", (chunk: Buffer | string) => chunks.push(String(chunk)));
-
+async function runWorkflow(dir: string, pipeline: string, env: NodeJS.ProcessEnv = {}) {
+	const file = path.join(dir, "workflow.lobster");
+	await fsp.writeFile(
+		file,
+		JSON.stringify({
+			cwd: dir,
+			steps: [{ id: "dispatch", pipeline, timeout_ms: 1000, retry: { max: 2, delay_ms: 10 } }],
+		}),
+	);
 	try {
-		const result = await runWorkflowFile({
-			filePath,
-			ctx: {
-				stdin: process.stdin,
-				stdout: process.stdout,
-				stderr,
-				env: { ...process.env, LOBSTER_STATE_DIR: stateDir, ...opts?.env },
-				mode: "tool",
-				registry: opts?.registry ?? createDefaultRegistry(),
-			},
+		await execFileAsync(process.execPath, [cli, "run", "--mode", "tool", "--file", file], {
+			env: { ...process.env, LOBSTER_STATE_DIR: path.join(dir, "state"), ...env },
+			timeout: 15_000,
 		});
-		return { result, stderrOutput: chunks.join("") };
-	} finally {
-		await fsp.rm(tmpDir, { recursive: true, force: true });
+		assert.fail("workflow should fail after dispatch");
+	} catch (error: any) {
+		assert.equal(error.killed, false, "CLI must settle without the test timeout");
+		const envelope = JSON.parse(error.stdout);
+		assert.equal(envelope.ok, false);
+		assert.doesNotMatch(error.stderr, /\[RETRY\]/);
+		return envelope.error.message as string;
 	}
 }
 
-function invokePipeline(commandName: string, port: number) {
-	return `${commandName} --url http://127.0.0.1:${port} --tool message --action send --args-json '{"to":"x","message":"hi"}'`;
-}
-
-function createLegacyInvokeCommand(name: string) {
-	return {
-		name,
-		help() {
-			return "";
-		},
-		async run({ input, args, ctx }: { input: AsyncIterable<unknown>; args: any; ctx: any }) {
-			for await (const _item of input) {
-			}
-			const url = String(args.url ?? "");
-			const endpoint = new URL("/tools/invoke", url);
-			await fetch(endpoint, {
-				method: "POST",
-				signal: ctx.signal,
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({
-					tool: String(args.tool),
-					action: String(args.action),
-					args: {},
-				}),
+for (const command of [
+	"openclaw.invoke",
+	"clawd.invoke",
+	"openclaw.invoke --dry-run",
+	"openclaw.invoke --dryRun",
+]) {
+	for (const failure of ["timeout", "http-error", "downstream-error"]) {
+		test(`${command} does not repeat a dispatched tool after ${failure}`, async () => {
+			const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-dispatch-retry-"));
+			let hits = 0;
+			const server = http.createServer((req, res) => {
+				assert.equal(req.method, "POST");
+				assert.equal(req.url, "/tools/invoke");
+				hits++;
+				req.resume();
+				if (failure === "http-error") res.writeHead(503).end("unavailable after dispatch");
+				if (failure === "downstream-error") res.end(JSON.stringify({ ok: true, result: "done" }));
 			});
-			return {
-				output: (async function* () {})(),
-			};
-		},
-	};
-}
-
-function createLegacyAgentCommand(runCli: (params: { signal?: AbortSignal }) => Promise<unknown>) {
-	return {
-		name: "openclaw.agent",
-		help() {
-			return "";
-		},
-		async run({ input, ctx }: { input: AsyncIterable<unknown>; args: any; ctx: any }) {
-			for await (const _item of input) {
+			try {
+				await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+				const port = (server.address() as { port: number }).port;
+				const pipeline =
+					`${command} --url http://127.0.0.1:${port} --token= --tool demo --action write` +
+					(failure === "downstream-error" ? " | missing.command" : "");
+				const message = await runWorkflow(dir, pipeline);
+				assert.match(
+					message,
+					failure === "timeout"
+						? /timed out/
+						: failure === "http-error"
+							? /503/
+							: /Unknown command/,
+				);
+				assert.equal(hits, 1, "a failed step must not repeat a potentially completed tool call");
+			} finally {
+				server.closeAllConnections();
+				await new Promise<void>((resolve) => server.close(() => resolve()));
+				await fsp.rm(dir, { recursive: true, force: true });
 			}
-			await runCli({ signal: ctx?.signal });
-			return {
-				output: (async function* () {
-					yield { ok: true };
-				})(),
-			};
-		},
-	};
+		});
+	}
 }
 
-test("without the side-effect hook, a timed-out openclaw.invoke fetch is retried", async () => {
-	const hanging = hangingInvokeServer();
-	const port = await listen(hanging.server);
-	try {
-		await assert.rejects(
-			() =>
-				runWorkflow(
-					{
-						name: "legacy-invoke-retries",
-						steps: [
-							{
-								id: "send",
-								pipeline: invokePipeline("openclaw.invoke", port),
-								timeout_ms: 250,
-								retry: { max: 2, delay_ms: 20 },
-							},
-						],
-					},
-					{
-						registry: withCommands(
-							createDefaultRegistry(),
-							createLegacyInvokeCommand("openclaw.invoke"),
-						),
-					},
-				).then((r) => r.result),
-			/timed out|abort/i,
-		);
-		assert.equal(
-			hanging.hits,
-			2,
-			"old invoke (no hook) must dispatch a second fetch after timeout",
-		);
-	} finally {
-		await new Promise<void>((resolve, reject) => {
-			hanging.server.close((err) => (err ? reject(err) : resolve()));
-		});
-	}
-});
-
-test("openclaw.invoke timeout + retry.max>1 does not dispatch a second fetch", async () => {
-	const hanging = hangingInvokeServer();
-	const port = await listen(hanging.server);
-	try {
-		await assert.rejects(
-			() =>
-				runWorkflow({
-					name: "invoke-no-retry-after-dispatch",
-					steps: [
-						{
-							id: "send",
-							pipeline: invokePipeline("openclaw.invoke", port),
-							timeout_ms: 250,
-							retry: { max: 2, delay_ms: 20 },
-						},
-					],
-				}).then((r) => r.result),
-			/timed out|abort/i,
-		);
-		assert.equal(hanging.hits, 1, "timed-out invoke must not POST a second time");
-	} finally {
-		await new Promise<void>((resolve, reject) => {
-			hanging.server.close((err) => (err ? reject(err) : resolve()));
-		});
-	}
-});
-
-test("clawd.invoke timeout + retry.max>1 does not dispatch a second fetch", async () => {
-	const hanging = hangingInvokeServer();
-	const port = await listen(hanging.server);
-	try {
-		await assert.rejects(
-			() =>
-				runWorkflow({
-					name: "clawd-invoke-no-retry-after-dispatch",
-					steps: [
-						{
-							id: "send",
-							pipeline: invokePipeline("clawd.invoke", port),
-							timeout_ms: 250,
-							retry: { max: 2, delay_ms: 20 },
-						},
-					],
-				}).then((r) => r.result),
-			/timed out|abort/i,
-		);
-		assert.equal(hanging.hits, 1, "timed-out clawd.invoke must not POST a second time");
-	} finally {
-		await new Promise<void>((resolve, reject) => {
-			hanging.server.close((err) => (err ? reject(err) : resolve()));
-		});
-	}
-});
-
-test("without the side-effect hook, a timed-out openclaw.agent CLI run is retried", async () => {
-	let calls = 0;
-	const runCli = async ({ signal }: { signal?: AbortSignal }) => {
-		calls += 1;
-		await hangUntilAbort(signal);
-	};
-	await assert.rejects(
-		() =>
-			runWorkflow(
+for (const failure of ["timeout", "process-error"]) {
+	test(`openclaw.agent default process runner dispatches once after ${failure}`, async () => {
+		const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-agent-retry-"));
+		try {
+			// Node receives "agent" as its script, exercising the default argv/process runner.
+			await fsp.writeFile(
+				path.join(dir, "agent"),
+				`
+const fs = require("node:fs");
+fs.appendFileSync("calls", String(process.pid) + "\\n");
+${failure === "timeout" ? "setInterval(() => {}, 1000);" : 'process.stderr.write("failed after dispatch"); process.exitCode = 1;'}
+`,
+			);
+			const message = await runWorkflow(
+				dir,
+				'openclaw.agent --agent test --prompt "synthetic proof"',
 				{
-					name: "legacy-agent-retries",
-					steps: [
-						{
-							id: "agent",
-							pipeline: 'openclaw.agent --agent ops --prompt "Send the update"',
-							timeout_ms: 250,
-							retry: { max: 2, delay_ms: 20 },
-						},
-					],
+					LOBSTER_OPENCLAW_BIN: process.execPath,
 				},
-				{ registry: withCommands(createDefaultRegistry(), createLegacyAgentCommand(runCli)) },
-			).then((r) => r.result),
-		/timed out|abort/i,
-	);
-	assert.equal(calls, 2, "old agent (no hook) must dispatch a second CLI run after timeout");
-});
-
-test("openclaw.agent timeout + retry.max>1 does not dispatch a second CLI run", async () => {
-	let calls = 0;
-	const cmd = createOpenClawAgentCommand(async ({ signal }) => {
-		calls += 1;
-		await hangUntilAbort(signal);
+			);
+			assert.match(message, failure === "timeout" ? /timed out/ : /failed after dispatch/);
+			const pids = (await fsp.readFile(path.join(dir, "calls"), "utf8")).trim().split("\n");
+			assert.equal(pids.length, 1, "the default runner must launch only one child");
+			assert.throws(() => process.kill(Number(pids[0]), 0), { code: "ESRCH" });
+		} finally {
+			await fsp.rm(dir, { recursive: true, force: true });
+		}
 	});
-	await assert.rejects(
-		() =>
-			runWorkflow(
-				{
-					name: "agent-no-retry-after-dispatch",
-					steps: [
-						{
-							id: "agent",
-							pipeline: 'openclaw.agent --agent ops --prompt "Send the update"',
-							timeout_ms: 250,
-							retry: { max: 2, delay_ms: 20 },
-						},
-					],
-				},
-				{ registry: withCommands(createDefaultRegistry(), cmd) },
-			).then((r) => r.result),
-		/timed out|abort/i,
-	);
-	assert.equal(calls, 1, "timed-out agent must not start a second CLI run");
-});
+}
