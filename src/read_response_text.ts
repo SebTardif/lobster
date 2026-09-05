@@ -1,6 +1,15 @@
-export const HTTP_RESPONSE_MAX_BYTES = 10 * 1024 * 1024;
+export function httpResponseLimitFromEnv(env: NodeJS.ProcessEnv): number | undefined {
+	const raw = env.LOBSTER_MAX_HTTP_RESPONSE_BYTES?.trim();
+	if (!raw) return undefined;
+	const value = Number(raw);
+	if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value <= 0) {
+		throw new Error("LOBSTER_MAX_HTTP_RESPONSE_BYTES must be a positive safe integer (bytes)");
+	}
+	return value;
+}
 
-export async function readResponseTextCapped(res: Response, maxBytes: number): Promise<string> {
+export async function readResponseTextCapped(res: Response, maxBytes?: number): Promise<string> {
+	if (maxBytes === undefined) return res.text();
 	if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
 		throw new Error("maxBytes must be a non-negative safe integer");
 	}

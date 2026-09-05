@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 import http from "node:http";
 
 import { createDefaultRegistry } from "../src/commands/registry.js";
-import { HTTP_RESPONSE_MAX_BYTES, readResponseTextCapped } from "../src/read_response_text.js";
+import { readResponseTextCapped } from "../src/read_response_text.js";
 
+const HTTP_RESPONSE_MAX_BYTES = 10 * 1024 * 1024;
 const OVER_LIMIT_BYTES = HTTP_RESPONSE_MAX_BYTES + 1;
 
 function streamOf(items: unknown[]) {
@@ -18,7 +19,7 @@ function invokeCtx(registry: ReturnType<typeof createDefaultRegistry>) {
 		stdin: process.stdin,
 		stdout: process.stdout,
 		stderr: process.stderr,
-		env: process.env,
+		env: { ...process.env, LOBSTER_MAX_HTTP_RESPONSE_BYTES: String(HTTP_RESPONSE_MAX_BYTES) },
 		registry,
 		mode: "tool" as const,
 		render: { json() {}, lines() {} },
@@ -186,5 +187,175 @@ test("openclaw.invoke rejects a streaming body over 10 MiB", async () => {
 		);
 	} finally {
 		await closeServer(server);
+	}
+});
+
+test("HTTP reader accepts the exact byte boundary and has no default cap", async () => {
+	assert.equal(await readResponseTextCapped(new Response("😀"), 4), "😀");
+	assert.equal(
+		(await readResponseTextCapped(new Response("x".repeat(OVER_LIMIT_BYTES)))).length,
+		OVER_LIMIT_BYTES,
+	);
+});
+
+for (const provider of ["openclaw.invoke", "clawd.invoke", "openclaw", "http", "pi"]) {
+	for (const chunked of [false, true]) {
+		test(`${provider} HTTP responses stay unlimited by default and honor opt-in limits (${chunked ? "chunked" : "declared"})`, async () => {
+			const { runToolRequest } = await import("../src/core/tool_runtime.js");
+			let hits = 0;
+			const payload = JSON.stringify({
+				ok: true,
+				result: { output: { data: { value: "x".repeat(OVER_LIMIT_BYTES) } } },
+			});
+			const server = http.createServer((req, res) => {
+				hits++;
+				req.resume();
+				res.setHeader("content-type", "application/json");
+				if (!chunked) res.setHeader("content-length", Buffer.byteLength(payload));
+				else res.writeHead(200);
+				res.end(payload);
+			});
+			const port = await listen(server);
+			try {
+				const url = `http://127.0.0.1:${port}`;
+				const pipeline = provider.endsWith(".invoke")
+					? `${provider} --url ${url} --token= --tool demo --action read`
+					: `llm.invoke --provider ${provider} --prompt synthetic --disable-cache`;
+				for (const limit of ["", "1024"]) {
+					const result = await runToolRequest({
+						pipeline,
+						ctx: {
+							env: {
+								LOBSTER_MAX_HTTP_RESPONSE_BYTES: limit,
+								OPENCLAW_URL: url,
+								LOBSTER_LLM_ADAPTER_URL: url,
+								LOBSTER_PI_LLM_ADAPTER_URL: url,
+							},
+						},
+					});
+					assert.equal(result.ok, limit === "");
+					if (limit) assert.match(result.error!.message, /HTTP response body exceeded 1024 bytes/);
+					else assert.ok(JSON.stringify(result.output).length > OVER_LIMIT_BYTES);
+				}
+				assert.equal(hits, 2);
+			} finally {
+				server.closeAllConnections();
+				await closeServer(server);
+			}
+		});
+	}
+}
+
+test("invalid HTTP limit is rejected before tool dispatch", async () => {
+	const { runToolRequest } = await import("../src/core/tool_runtime.js");
+	let hits = 0;
+	const server = http.createServer((req, res) => {
+		hits++;
+		req.resume();
+		res.end("{}");
+	});
+	const port = await listen(server);
+	try {
+		for (const limit of ["0", "-1", "1.5", "Infinity", "true", "9007199254740992"]) {
+			const result = await runToolRequest({
+				pipeline: `openclaw.invoke --url http://127.0.0.1:${port} --tool demo --action read`,
+				ctx: { env: { LOBSTER_MAX_HTTP_RESPONSE_BYTES: limit } },
+			});
+			assert.equal(result.ok, false);
+			assert.match(
+				result.error!.message,
+				/LOBSTER_MAX_HTTP_RESPONSE_BYTES must be a positive safe integer/,
+			);
+		}
+		assert.equal(hits, 0);
+	} finally {
+		await closeServer(server);
+	}
+});
+
+test("SDK environment configures the HTTP response limit", async () => {
+	const { Lobster } = await import("../src/sdk/index.js");
+	const server = http.createServer((req, res) => {
+		req.resume();
+		res.end(JSON.stringify({ ok: true, result: "x".repeat(2048) }));
+	});
+	const port = await listen(server);
+	try {
+		const command = createDefaultRegistry().get("openclaw.invoke");
+		const result = await new Lobster({ env: { LOBSTER_MAX_HTTP_RESPONSE_BYTES: "1024" } })
+			.pipe({
+				run: ({ input, ctx }) =>
+					command.run({
+						input,
+						ctx,
+						args: { _: [], url: `http://127.0.0.1:${port}`, tool: "demo", action: "read" },
+					}),
+			})
+			.run();
+		assert.equal(result.ok, false);
+		assert.match(result.error.message, /HTTP response body exceeded 1024 bytes/);
+	} finally {
+		await closeServer(server);
+	}
+});
+
+test("built CLI workflow limit never replays an oversized dispatched tool result", async () => {
+	const { execFile } = await import("node:child_process");
+	const { promisify } = await import("node:util");
+	const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+	const { tmpdir } = await import("node:os");
+	const path = await import("node:path");
+	const dir = await mkdtemp(path.join(tmpdir(), "lobster-http-limit-cli-"));
+	let hits = 0;
+	let chunked = false;
+	const payload = JSON.stringify({ ok: true, result: "x".repeat(OVER_LIMIT_BYTES) });
+	const server = http.createServer((req, res) => {
+		hits++;
+		req.resume();
+		if (!chunked) res.setHeader("content-length", Buffer.byteLength(payload));
+		else res.writeHead(200);
+		res.end(payload);
+	});
+	const port = await listen(server);
+	try {
+		for (chunked of [false, true]) {
+			for (const limit of ["", "1024"]) {
+				hits = 0;
+				const file = path.join(dir, "workflow.json");
+				await writeFile(
+					file,
+					JSON.stringify({
+						steps: [
+							{
+								id: "invoke",
+								pipeline: `openclaw.invoke --url http://127.0.0.1:${port} --token= --tool demo --action write`,
+								env: { LOBSTER_MAX_HTTP_RESPONSE_BYTES: limit },
+								retry: { max: 2, delay_ms: 10 },
+							},
+						],
+					}),
+				);
+				const result = await promisify(execFile)(
+					process.execPath,
+					[path.resolve("bin/lobster.js"), "run", "--mode", "tool", "--file", file],
+					{
+						env: { ...process.env, LOBSTER_STATE_DIR: path.join(dir, "state") },
+						maxBuffer: 20 * 1024 * 1024,
+					},
+				).then(
+					(r) => ({ stdout: r.stdout, stderr: r.stderr }),
+					(e) => ({ stdout: e.stdout, stderr: e.stderr }),
+				);
+				const envelope = JSON.parse(result.stdout);
+				assert.equal(envelope.ok, limit === "");
+				assert.equal(hits, 1, "the landed dispatch guard must prevent a second POST");
+				assert.doesNotMatch(result.stderr, /\[RETRY\]/);
+				if (limit) assert.match(envelope.error.message, /HTTP response body exceeded 1024 bytes/);
+			}
+		}
+	} finally {
+		server.closeAllConnections();
+		await closeServer(server);
+		await rm(dir, { recursive: true, force: true });
 	}
 });

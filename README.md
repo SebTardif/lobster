@@ -405,3 +405,25 @@ steps:
     command: |
       jq -n --arg text "$TEXT" '{"result": $text}'
 ```
+
+## HTTP response limits
+
+HTTP response bodies remain unlimited by default. Set
+`LOBSTER_MAX_HTTP_RESPONSE_BYTES` to a positive integer to opt into a per-response
+byte limit for `openclaw.invoke`/`clawd.invoke` and the built-in OpenClaw, HTTP,
+and Pi `llm.invoke` adapters. Unset or empty means unlimited; invalid or non-positive
+values fail before dispatch. Host-injected adapters own their transport limits.
+
+```bash
+LOBSTER_MAX_HTTP_RESPONSE_BYTES=1048576 lobster run --mode tool 'openclaw.invoke --tool example --action read'
+```
+
+Workflow and step `env` can set the same variable. SDK integrations pass it in
+their environment (`new Lobster({ env: { ...process.env,
+LOBSTER_MAX_HTTP_RESPONSE_BYTES: "1048576" } })` or the tool-runtime context).
+Responses exactly at the limit succeed. Oversized declared or streamed bodies
+are cancelled and rejected before JSON parsing; no partial response is returned.
+The limit counts bytes read from the response stream, including decompressed
+content. A declared Content-Length over the limit is also rejected immediately.
+Tool dispatch remains non-retryable after an overflow, as with other
+post-dispatch errors; `llm.invoke` retains its existing retry policy.
