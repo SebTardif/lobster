@@ -1128,139 +1128,6 @@ export async function runWorkflowFile({
 				continue;
 			}
 
-			if (typeof step.for_each === "string" && Array.isArray(step.steps)) {
-				const itemsRef = resolveInputValue(step.for_each, resolvedArgs, results);
-				if (!Array.isArray(itemsRef)) {
-					throw new Error(
-						`Workflow step ${step.id} for_each: expected array, got ${typeof itemsRef}`,
-					);
-				}
-
-				const itemVar = step.item_var ?? "item";
-				const indexVar = step.index_var ?? "index";
-				const batchSize = step.batch_size ?? 1;
-				const iterationResults: unknown[] = [];
-
-				for (let itemIdx = 0; itemIdx < itemsRef.length; itemIdx++) {
-					ctx.signal?.throwIfAborted();
-					if (step.pause_ms && itemIdx > 0 && itemIdx % batchSize === 0) {
-						await abortableSleep(step.pause_ms, ctx.signal);
-					}
-
-					const item = itemsRef[itemIdx];
-					const scopedResults = createRecord(results);
-					scopedResults[itemVar] = {
-						id: itemVar,
-						json: item,
-						stdout: typeof item === "string" ? item : JSON.stringify(item),
-					};
-					scopedResults[indexVar] = {
-						id: indexVar,
-						json: itemIdx,
-						stdout: String(itemIdx),
-					};
-
-					for (const subStep of step.steps) {
-						ctx.signal?.throwIfAborted();
-						if (!evaluateCondition(subStep.when ?? subStep.condition, scopedResults)) {
-							scopedResults[subStep.id] = { id: subStep.id, skipped: true };
-							continue;
-						}
-
-						const loopEnvBase = mergeEnv(
-							ctx.env,
-							workflow.env,
-							step.env,
-							resolvedArgs,
-							scopedResults,
-						);
-						const subEnv = subStep.env
-							? mergeEnv(loopEnvBase, undefined, subStep.env, resolvedArgs, scopedResults)
-							: loopEnvBase;
-						const subCwd =
-							resolveCwd(subStep.cwd ?? step.cwd ?? workflow.cwd, resolvedArgs) ?? ctx.cwd;
-						const subExecution = getStepExecution(subStep);
-
-						let subResult: WorkflowStepResult;
-						if (subExecution.kind === "shell") {
-							const command = resolveTemplate(subExecution.value, resolvedArgs, scopedResults);
-							const stdinValue = resolveShellStdin(subStep.stdin, resolvedArgs, scopedResults);
-							await markExecutionStarted(ctx.signal);
-							const { stdout } = await runShellCommand({
-								command,
-								stdin: stdinValue,
-								env: subEnv,
-								cwd: subCwd,
-								signal: ctx.signal,
-								forceTerminationSignal: ctx.forceTerminationSignal,
-							});
-							subResult = { id: subStep.id, stdout, json: parseJson(stdout) };
-						} else if (subExecution.kind === "pipeline") {
-							if (!ctx.registry) {
-								throw new Error(
-									`Workflow step ${step.id} for_each sub-step ${subStep.id} requires a command registry for pipeline execution`,
-								);
-							}
-							const pipelineText = resolveTemplate(subExecution.value, resolvedArgs, scopedResults);
-							const inputValue = resolveInputValue(subStep.stdin, resolvedArgs, scopedResults);
-							subResult = await runPipelineStep({
-								stepId: subStep.id,
-								pipelineText,
-								inputValue,
-								ctx,
-								llmSpendLedger,
-								env: subEnv,
-								cwd: subCwd,
-								requestInputEnabled: false,
-								onExecutionStart: () => markExecutionStarted(ctx.signal),
-							});
-						} else {
-							const inputValue = resolveInputValue(subStep.stdin, resolvedArgs, scopedResults);
-							subResult = createSyntheticStepResult(subStep.id, inputValue);
-						}
-
-						scopedResults[subStep.id] = subResult;
-						trackStepCost(costTracker, `${step.id}.${subStep.id}`, subResult, llmSpendLedger);
-						// Before the next step runs: a charge no item carried is spend the step really made,
-						// and leaving it for the end would let `cost_limit` wave through every step after the
-						// one that blew the budget.
-						settleUnbilledCharges(costTracker, llmSpendLedger);
-						if (workflow.cost_limit) {
-							costTracker.checkLimit(workflow.cost_limit, ctx.stderr);
-						}
-					}
-
-					const iterResult = createRecord<unknown>();
-					iterResult[itemVar] = item;
-					iterResult[indexVar] = itemIdx;
-					for (const subStep of step.steps) {
-						const subResult = scopedResults[subStep.id];
-						if (subResult && !subResult.skipped) {
-							iterResult[subStep.id] =
-								subResult.json !== undefined ? subResult.json : subResult.stdout;
-						}
-					}
-					iterationResults.push(Object.fromEntries(Object.entries(iterResult)));
-				}
-
-				const loopResult: WorkflowStepResult = {
-					id: step.id,
-					json: iterationResults,
-					stdout: JSON.stringify(iterationResults),
-				};
-				results[step.id] = loopResult;
-				lastStepId = step.id;
-				trackStepCost(costTracker, step.id, loopResult, llmSpendLedger);
-				// Before the next step runs: a charge no item carried is spend the step really made,
-				// and leaving it for the end would let `cost_limit` wave through every step after the
-				// one that blew the budget.
-				settleUnbilledCharges(costTracker, llmSpendLedger);
-				if (workflow.cost_limit) {
-					costTracker.checkLimit(workflow.cost_limit, ctx.stderr);
-				}
-				continue;
-			}
-
 			const env = mergeEnv(ctx.env, workflow.env, step.env, resolvedArgs, results);
 			const cwd = resolveCwd(step.cwd ?? workflow.cwd, resolvedArgs) ?? ctx.cwd;
 			const execution = getStepExecution(step);
@@ -1297,7 +1164,139 @@ export async function runWorkflowFile({
 				let result: WorkflowStepResult;
 				let parallelBranchResults: Record<string, WorkflowStepResult> | null = null;
 				try {
-					if (execution.kind === "parallel") {
+					if (typeof step.for_each === "string" && Array.isArray(step.steps)) {
+						const itemsRef = resolveInputValue(step.for_each, resolvedArgs, results);
+						if (!Array.isArray(itemsRef)) {
+							throw new Error(
+								`Workflow step ${step.id} for_each: expected array, got ${typeof itemsRef}`,
+							);
+						}
+
+						const itemVar = step.item_var ?? "item";
+						const indexVar = step.index_var ?? "index";
+						const batchSize = step.batch_size ?? 1;
+						const iterationResults: unknown[] = [];
+
+						for (let itemIdx = 0; itemIdx < itemsRef.length; itemIdx++) {
+							stepSignal?.throwIfAborted();
+							if (step.pause_ms && itemIdx > 0 && itemIdx % batchSize === 0) {
+								await abortableSleep(step.pause_ms, stepSignal);
+							}
+
+							const item = itemsRef[itemIdx];
+							const scopedResults = createRecord(results);
+							scopedResults[itemVar] = {
+								id: itemVar,
+								json: item,
+								stdout: typeof item === "string" ? item : JSON.stringify(item),
+							};
+							scopedResults[indexVar] = {
+								id: indexVar,
+								json: itemIdx,
+								stdout: String(itemIdx),
+							};
+
+							for (const subStep of step.steps) {
+								stepSignal?.throwIfAborted();
+								if (!evaluateCondition(subStep.when ?? subStep.condition, scopedResults)) {
+									scopedResults[subStep.id] = { id: subStep.id, skipped: true };
+									continue;
+								}
+
+								const loopEnvBase = mergeEnv(
+									ctx.env,
+									workflow.env,
+									step.env,
+									resolvedArgs,
+									scopedResults,
+								);
+								const subEnv = subStep.env
+									? mergeEnv(loopEnvBase, undefined, subStep.env, resolvedArgs, scopedResults)
+									: loopEnvBase;
+								const subCwd =
+									resolveCwd(subStep.cwd ?? step.cwd ?? workflow.cwd, resolvedArgs) ?? ctx.cwd;
+								const subExecution = getStepExecution(subStep);
+
+								let subResult: WorkflowStepResult;
+								if (subExecution.kind === "shell") {
+									const command = resolveTemplate(subExecution.value, resolvedArgs, scopedResults);
+									const stdinValue = resolveShellStdin(subStep.stdin, resolvedArgs, scopedResults);
+									await markExecutionStarted(stepSignal);
+									const { stdout } = await runShellCommand({
+										command,
+										stdin: stdinValue,
+										env: subEnv,
+										cwd: subCwd,
+										signal: stepSignal,
+										forceTerminationSignal: ctx.forceTerminationSignal,
+										killSignal: () =>
+											stepTimeoutController?.signal.aborted
+												? ("SIGKILL" as NodeJS.Signals)
+												: undefined,
+									});
+									subResult = { id: subStep.id, stdout, json: parseJson(stdout) };
+								} else if (subExecution.kind === "pipeline") {
+									if (!ctx.registry) {
+										throw new Error(
+											`Workflow step ${step.id} for_each sub-step ${subStep.id} requires a command registry for pipeline execution`,
+										);
+									}
+									const pipelineText = resolveTemplate(
+										subExecution.value,
+										resolvedArgs,
+										scopedResults,
+									);
+									const inputValue = resolveInputValue(subStep.stdin, resolvedArgs, scopedResults);
+									subResult = await runPipelineStep({
+										stepId: subStep.id,
+										pipelineText,
+										inputValue,
+										ctx: {
+											...ctx,
+											signal: stepSignal,
+											_onNonRetryableSideEffect: markNonRetryableSideEffect,
+										},
+										llmSpendLedger,
+										env: subEnv,
+										cwd: subCwd,
+										requestInputEnabled: false,
+										onExecutionStart: () => markExecutionStarted(stepSignal),
+									});
+								} else {
+									const inputValue = resolveInputValue(subStep.stdin, resolvedArgs, scopedResults);
+									subResult = createSyntheticStepResult(subStep.id, inputValue);
+								}
+
+								scopedResults[subStep.id] = subResult;
+								trackStepCost(costTracker, `${step.id}.${subStep.id}`, subResult, llmSpendLedger);
+								// Before the next step runs: a charge no item carried is spend the step really made,
+								// and leaving it for the end would let `cost_limit` wave through every step after the
+								// one that blew the budget.
+								settleUnbilledCharges(costTracker, llmSpendLedger);
+								if (workflow.cost_limit) {
+									costTracker.checkLimit(workflow.cost_limit, ctx.stderr);
+								}
+							}
+
+							const iterResult = createRecord<unknown>();
+							iterResult[itemVar] = item;
+							iterResult[indexVar] = itemIdx;
+							for (const subStep of step.steps) {
+								const subResult = scopedResults[subStep.id];
+								if (subResult && !subResult.skipped) {
+									iterResult[subStep.id] =
+										subResult.json !== undefined ? subResult.json : subResult.stdout;
+								}
+							}
+							iterationResults.push(Object.fromEntries(Object.entries(iterResult)));
+						}
+
+						result = {
+							id: step.id,
+							json: iterationResults,
+							stdout: JSON.stringify(iterationResults),
+						};
+					} else if (execution.kind === "parallel") {
 						const parallel = execution.value;
 						const wait = parallel.wait ?? "all";
 						const branchAbortController = new AbortController();
@@ -2077,6 +2076,16 @@ function dryRunWorkflow({
 					lines.push(`       ${subIdx + 1}. ${sub.id}  [no-op]`);
 				}
 				loopScopedResults[sub.id] = { id: sub.id };
+			}
+			if (step.timeout_ms) lines.push(`     timeout: ${step.timeout_ms}ms`);
+			if (step.on_error && step.on_error !== "stop") lines.push(`     on_error: ${step.on_error}`);
+			if (step.retry && typeof step.retry === "object") {
+				const rc = resolveRetryConfig(step.retry as RetryConfig);
+				if (rc.max > 1) {
+					lines.push(
+						`     retry: up to ${rc.max} attempts, ${rc.backoff} backoff (base: ${rc.delay_ms}ms${rc.jitter ? ", jitter" : ""})`,
+					);
+				}
 			}
 			results[step.id] = { id: step.id };
 			continue;
