@@ -34,7 +34,7 @@ import type {
 	LlmOutstandingCharge,
 	LlmSpendLedger,
 } from "../commands/stdlib/llm_invoke.js";
-import { CostTracker } from "../core/cost_tracker.js";
+import { CostLimitExceededError, CostTracker } from "../core/cost_tracker.js";
 import type { CostLimit, CostSummary } from "../core/cost_tracker.js";
 import { withRetry, resolveRetryConfig } from "../core/retry.js";
 import type { RetryConfig } from "../core/retry.js";
@@ -1605,7 +1605,8 @@ export async function runWorkflowFile({
 								shouldRetry: (error) => {
 									if (
 										error instanceof WorkflowPipelineInputSuspension ||
-										error instanceof RequestInputResumeError
+										error instanceof RequestInputResumeError ||
+										error instanceof CostLimitExceededError
 									) {
 										return false;
 									}
@@ -1699,6 +1700,9 @@ export async function runWorkflowFile({
 					}
 				}
 				if (err instanceof RequestInputResumeError) {
+					throw err;
+				}
+				if (err instanceof CostLimitExceededError) {
 					throw err;
 				}
 				if (ctx.signal?.aborted) {

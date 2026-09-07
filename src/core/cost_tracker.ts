@@ -18,6 +18,13 @@ export type CostLimit = {
 	action?: "warn" | "stop";
 };
 
+export class CostLimitExceededError extends Error {
+	constructor(estimatedCostUsd: number, maxUsd: number) {
+		super(`Cost limit exceeded: $${estimatedCostUsd.toFixed(4)} > $${maxUsd.toFixed(2)} limit`);
+		this.name = "CostLimitExceededError";
+	}
+}
+
 const DEFAULT_PRICING: Record<string, { input: number; output: number }> = {
 	"gpt-4o": { input: 2.5, output: 10.0 },
 	"gpt-4o-mini": { input: 0.15, output: 0.6 },
@@ -138,9 +145,7 @@ export class CostTracker {
 		if (summary.estimatedCostUsd <= limit.max_usd) return;
 
 		if (limit.action === "stop") {
-			throw new Error(
-				`Cost limit exceeded: $${summary.estimatedCostUsd.toFixed(4)} > $${limit.max_usd.toFixed(2)} limit`,
-			);
+			throw new CostLimitExceededError(summary.estimatedCostUsd, limit.max_usd);
 		}
 
 		if (stderr) {
