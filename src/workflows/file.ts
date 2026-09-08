@@ -1613,6 +1613,12 @@ export async function runWorkflowFile({
 									if (isStepErrorNonRetryable(error)) {
 										return false;
 									}
+									if (ctx.signal?.aborted) return false;
+									if (workflow.cost_limit?.action === "stop") {
+										// Failed pipelines can discard output after the provider was paid.
+										settleUnbilledCharges(costTracker, llmSpendLedger);
+										costTracker.checkLimit(workflow.cost_limit, ctx.stderr);
+									}
 									const message = error?.message ?? String(error);
 									return !/halted (for approval inside|before completion at) pipeline/.test(
 										message,

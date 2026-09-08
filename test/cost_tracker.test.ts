@@ -2366,3 +2366,51 @@ test("workflow cost tracking leaves a discarded wait:any branch out of the total
 		running.result._meta?.cost?.totalInputTokens,
 	);
 });
+
+for (const loop of [false, true]) {
+	test(`cost_limit stops ${loop ? "for_each" : "pipeline"} retries after a paid call loses its output`, async () => {
+		let calls = 0;
+		const step = {
+			id: "spend",
+			pipeline:
+				'llm.invoke --provider budget-test --model gpt-4o --prompt test --refresh --disable-cache | exec --stdin json node -e "process.exit(1)"',
+		};
+		const retry = { max: 3, delay_ms: 1 };
+		await assert.rejects(
+			() =>
+				runWorkflow(
+					{
+						cost_limit: { max_usd: 0.001, action: "stop" },
+						steps: loop
+							? [
+									{ id: "data", pipeline: "exec --json node -e \"console.log('[1,2]')\"" },
+									{
+										id: "loop",
+										for_each: "$data.json",
+										retry,
+										on_error: "continue",
+										steps: [step],
+									},
+								]
+							: [{ ...step, retry, on_error: "continue" }],
+					},
+					undefined,
+					{
+						"budget-test": async () => {
+							calls++;
+							return {
+								ok: true,
+								result: {
+									output: { text: "paid" },
+									model: "gpt-4o",
+									usage: { inputTokens: 1000, outputTokens: 500 },
+								},
+							};
+						},
+					},
+				),
+			/Cost limit exceeded/,
+		);
+		assert.equal(calls, 1, "a downstream failure must not hide paid usage from the retry budget");
+	});
+}

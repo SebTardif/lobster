@@ -280,6 +280,7 @@ Notes:
 - If you need a human checkpoint before an LLM call, use a dedicated `approval:` step in the workflow file rather than `approve` inside the nested pipeline.
 - `cwd`, `env`, `stdin`, `when`, and `condition` work for both shell and pipeline steps.
 - Use `retry`, `timeout_ms`, and `on_error` per step to control transient-failure behavior and recovery.
+- On `for_each`, these policies cover the entire loop: each attempt gets one timeout budget (including batch pauses), and retry restarts at the first item. Previously completed children may run again, so only enable loop retries for work that is safe to repeat. A `cost_limit` stop or an attempted OpenClaw dispatch prevents retries; paid LLM usage is checked even when a later pipeline command fails. `on_error: continue` records `$loop.error` and proceeds to the next workflow step; `skip_rest` skips the remaining workflow steps.
 - Approval steps can optionally enforce identity constraints:
   - `approval.required_approver` (or `requiredApprover`) requires an exact approver id.
   - `approval.require_different_approver` (or `requireDifferentApprover`) requires approver id to differ from initiator.

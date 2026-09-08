@@ -313,31 +313,38 @@ async function runWorkflowWithIo(workflow: unknown) {
 	return { result, stderrOutput: chunks.join("") };
 }
 
-test("for_each timeout_ms aborts a hanging child step", async () => {
-	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-foreach-timeout-"));
-	const dataCmd = await writeNodeCommand(
-		tmpDir,
-		"data.js",
-		"process.stdout.write(JSON.stringify([1]));\n",
-	);
-	const hangCmd = await writeNodeCommand(tmpDir, "hang.js", "setTimeout(() => {}, 5000);\n");
+for (const pipeline of [false, true]) {
+	test(`for_each timeout_ms aborts a hanging ${pipeline ? "pipeline" : "shell"} child`, async (t) => {
+		const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-foreach-timeout-"));
+		t.after(() => fsp.rm(tmpDir, { recursive: true, force: true }));
+		const dataCmd = await writeNodeCommand(
+			tmpDir,
+			"data.js",
+			"process.stdout.write(JSON.stringify([1]));\n",
+		);
+		const hangCmd = await writeNodeCommand(tmpDir, "hang.js", "setTimeout(() => {}, 5000);\n");
 
-	await assert.rejects(
-		() =>
-			runWorkflow({
-				steps: [
-					{ id: "data", command: dataCmd },
-					{
-						id: "loop",
-						for_each: "$data.json",
-						timeout_ms: 200,
-						steps: [{ id: "slow", command: hangCmd }],
-					},
-				],
-			}),
-		/timed out after 200ms/,
-	);
-});
+		await assert.rejects(
+			() =>
+				runWorkflow({
+					steps: [
+						{ id: "data", command: dataCmd },
+						{
+							id: "loop",
+							for_each: "$data.json",
+							timeout_ms: 200,
+							steps: [
+								pipeline
+									? { id: "slow", pipeline: `exec ${hangCmd}` }
+									: { id: "slow", command: hangCmd },
+							],
+						},
+					],
+				}),
+			/timed out after 200ms/,
+		);
+	});
+}
 
 test("for_each timeout_ms with on_error continue records error and continues", async () => {
 	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-foreach-timeout-continue-"));
@@ -532,3 +539,69 @@ test("for_each dry-run renders timeout, retry, and on_error", async () => {
 	assert.match(out, /on_error: continue/);
 	assert.match(out, /retry: up to 3 attempts/);
 });
+
+test("for_each retries restart at the first item after a later item fails", async (t) => {
+	const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-foreach-restart-"));
+	t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+	const history = path.join(dir, "history.json");
+	const command = await writeNodeCommand(
+		dir,
+		"flaky.cjs",
+		`
+const fs = require("node:fs");
+const file = ${JSON.stringify(history)};
+const history = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : [];
+const item = Number(process.env.ITEM);
+history.push(item);
+fs.writeFileSync(file, JSON.stringify(history));
+if (history.length === 2) process.exit(1);
+console.log(item);
+`,
+	);
+	const result = await runWorkflow({
+		steps: [
+			{ id: "data", run: "node -e \"console.log('[1,2]')\"" },
+			{
+				id: "loop",
+				for_each: "$data.json",
+				retry: { max: 2, delay_ms: 1 },
+				steps: [{ id: "child", run: command, env: { ITEM: "$item.json" } }],
+			},
+		],
+	});
+	assert.equal(result.status, "ok");
+	assert.deepEqual(JSON.parse(await fsp.readFile(history, "utf8")), [1, 2, 1, 2]);
+	assert.deepEqual(result.output, [
+		{ item: 1, index: 0, child: 1 },
+		{ item: 2, index: 1, child: 2 },
+	]);
+});
+
+for (const customNames of [false, true]) {
+	test(`for_each resolves loop environment per item with ${customNames ? "custom" : "default"} names`, async () => {
+		const itemVar = customNames ? "value" : "item";
+		const indexVar = customNames ? "position" : "index";
+		const result = await runWorkflow({
+			steps: [
+				{ id: "data", run: "node -e \"console.log('[10,20]')\"" },
+				{
+					id: "loop",
+					for_each: "$data.json",
+					item_var: itemVar,
+					index_var: indexVar,
+					env: { ITEM: `$${itemVar}.json`, INDEX: `$${indexVar}.json` },
+					steps: [
+						{
+							id: "read",
+							run: 'node -e "console.log(JSON.stringify({item:process.env.ITEM,index:process.env.INDEX}))"',
+						},
+					],
+				},
+			],
+		});
+		assert.deepEqual(result.output, [
+			{ [itemVar]: 10, [indexVar]: 0, read: { item: "10", index: "0" } },
+			{ [itemVar]: 20, [indexVar]: 1, read: { item: "20", index: "1" } },
+		]);
+	});
+}
